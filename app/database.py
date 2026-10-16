@@ -10,6 +10,6 @@ class Database:
             password=settings.DB_PASSWORD,
             database=settings.DB_NAME,
             port=settings.DB_PORT,
-            autocommit=True,
+            autocommit=False,  # Permite transacciones manuales seguras
             cursorclass=pymysql.cursors.DictCursor
         )
