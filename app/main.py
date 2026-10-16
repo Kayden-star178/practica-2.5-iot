@@ -4,58 +4,52 @@ from app.services.iot_service import iot_service
 from app.websocket.manager import manager
 
 app = FastAPI(
-    title="API IoT - Vehículo Control - Práctica 2.5",
-    description="API desarrollada en Python con FastAPI y POO que consulta Stored Procedures en Amazon RDS.",
+    title="API Vehículo IoT - Práctica 2.5",
+    description="Integración de los 21 Stored Procedures de RDS en entorno Dev[cite: 6, 7]",
     version="1.0.0"
 )
 
-# -------------------------------------------------------------
-# Servicios GET (Consulta de datos a la BD)
-# -------------------------------------------------------------
-
+# --- SERVICIOS GET ---[cite: 7]
 @app.get("/api/vehiculos", tags=["Vehículos"])
 def obtener_vehiculos():
-    """Consulta sp_obtener_vehiculos"""
     return iot_service.ejecutar_sp("sp_obtener_vehiculos")
 
-@app.get("/api/comandos", tags=["Comandos"])
-def obtener_comandos():
-    """Consulta sp_obtener_comandos"""
-    return iot_service.ejecutar_sp("sp_obtener_comandos")
+@app.get("/api/vehiculos/{vehiculo_id}", tags=["Vehículos"])
+def obtener_vehiculo(vehiculo_id: int):
+    return iot_service.ejecutar_sp("sp_obtener_vehiculo", (vehiculo_id,))
+
+@app.get("/api/comandos/{vehiculo_id}", tags=["Comandos"])
+def obtener_comandos(vehiculo_id: int):
+    return iot_service.ejecutar_sp("sp_obtener_comandos_vehiculo", (vehiculo_id,))
 
 @app.get("/api/estado/{vehiculo_id}", tags=["Estado"])
 def obtener_estado(vehiculo_id: int):
-    """Consulta sp_obtener_estado"""
     return iot_service.ejecutar_sp("sp_obtener_estado", (vehiculo_id,))
 
 @app.get("/api/historial/{vehiculo_id}", tags=["Historial"])
 def obtener_historial(vehiculo_id: int):
-    """Consulta sp_obtener_historial"""
-    return iot_service.ejecutar_sp("sp_obtener_historial", (vehiculo_id,))
+    """Devuelve MÁXIMO los 10 movimientos más recientes."""
+    return iot_service.obtener_historial_limitado(vehiculo_id)
 
-# -------------------------------------------------------------
-# Servicios POST (Acciones / Operaciones)
-# -------------------------------------------------------------
-
+# --- SERVICIOS POST ---[cite: 7, 8]
 @app.post("/api/movimiento", tags=["Movimientos"])
 async def movimiento_individual(req: MovimientoRequest):
-    """Ejecuta el flujo de Movimiento Individual"""
     return await iot_service.procesar_movimiento_individual(req.vehiculo_id, req.comando_id)
 
 @app.post("/api/demo", tags=["DEMO"])
 async def ejecutar_demo(req: DemoRequest):
-    """Ejecuta el flujo de la DEMO"""
-    return await iot_service.ejecutar_demo(req.vehiculo_id)
+    return await iot_service.ejecutar_demo(req.vehiculo_id, req.demo_id)
 
-# -------------------------------------------------------------
-# Servicio WebSocket (Monitoreo en tiempo real)
-# -------------------------------------------------------------
-
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+# --- WEBSOCKET POR VEHÍCULO ---[cite: 8]
+@app.websocket("/ws/{vehiculo_id}")
+async def websocket_endpoint(websocket: WebSocket, vehiculo_id: int):
+    await manager.connect(websocket, vehiculo_id)
     try:
+        # Al abrir la conexión, envía el último estado disponible[cite: 8]
+        estado = iot_service.ejecutar_sp("sp_obtener_estado", (vehiculo_id,))
+        await websocket.send_json({"evento": "estado_inicial", "estado": estado})
+        
         while True:
             await websocket.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, vehiculo_id)

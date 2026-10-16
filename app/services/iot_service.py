@@ -1,82 +1,98 @@
 import asyncio
+from fastapi import HTTPException
 from app.database import Database
 from app.websocket.manager import manager
 
 class IoTService:
     def ejecutar_sp(self, sp_name: str, args: tuple = ()):
-        """Ejecuta cualquier Stored Procedure en Amazon RDS."""
         conn = Database.get_connection()
         try:
             with conn.cursor() as cursor:
                 cursor.callproc(sp_name, args)
-                resultado = cursor.fetchall()
-            return resultado
+                res = cursor.fetchall()
+            return res
         finally:
             conn.close()
 
     async def procesar_movimiento_individual(self, vehiculo_id: int, comando_id: int):
-        """
-        Flujo de movimiento individual (POST)[cite: 1]:
-        1. Recibe petición con vehículo y comando[cite: 1].
-        2. Valida datos (vehículo y comando activos)[cite: 1].
-        3. Ejecuta sp_actualizar_estado[cite: 1].
-        4. Ejecuta sp_registrar_historial[cite: 1].
-        5. Notifica el movimiento por WebSocket[cite: 1].
-        6. Se registra en el historial[cite: 1].
-        """
-        # Validación
-        vehiculos = self.ejecutar_sp("sp_obtener_vehiculos")
-        v_valido = any(v.get('id') == vehiculo_id and v.get('activo', True) for v in vehiculos) if vehiculos else True
-        
-        if not v_valido:
-            return {"status": "error", "mensaje": "Vehículo o comando inactivo/inválido"}
+        # 1. Validar que el vehículo exista y esté activo[cite: 7]
+        vehiculos = self.ejecutar_sp("sp_obtener_vehiculo", (vehiculo_id,))
+        if not vehiculos or not vehiculos[0].get("activo", True):
+            raise HTTPException(status_code=400, detail="El vehículo no existe o está inactivo")
 
-        # Actualizar estado y registrar en historial
-        self.ejecutar_sp("sp_actualizar_estado", (vehiculo_id, comando_id))
-        self.ejecutar_sp("sp_registrar_historial", (vehiculo_id, comando_id))
+        # 2. Validar que el comando pertenezca a ese vehículo y esté activo[cite: 7]
+        comandos = self.ejecutar_sp("sp_obtener_comandos_vehiculo", (vehiculo_id,))
+        comando_valido = any(c.get("id_comando") == comando_id and c.get("activo", True) for c in comandos)
+        if not comando_valido:
+            raise HTTPException(status_code=400, detail="El comando no pertenece al vehículo o está inactivo")
 
-        # Notificar mediante WebSocket
+        # 3. Transacción atómica en RDS: Actualizar estado y registrar en historial[cite: 7, 9]
+        conn = Database.get_connection()
+        try:
+            with conn.cursor() as cursor:
+                cursor.callproc("sp_actualizar_estado", (vehiculo_id, comando_id))
+                cursor.callproc("sp_registrar_historial", (vehiculo_id, comando_id))
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=f"Error en transacción RDS: {str(e)}")
+        finally:
+            conn.close()
+
+        # 4. Notificar movimiento por WebSocket solo a los monitores del vehículo[cite: 7, 8]
         payload = {
-            "tipo": "movimiento_individual",
+            "evento": "movimiento_individual",
             "vehiculo_id": vehiculo_id,
             "comando_id": comando_id,
             "estado": "ejecutado"
         }
-        await manager.broadcast(payload)
+        await manager.broadcast_to_vehicle(vehiculo_id, payload)
 
         return {"status": "ok", "mensaje": "Movimiento registrado con éxito", "datos": payload}
 
-    async def ejecutar_demo(self, vehiculo_id: int):
-        """
-        Flujo de Ejecución de DEMO (POST)[cite: 1]:
-        Pasa (vehiculo_id,) como argumento al Stored Procedure.
-        """
-        movimientos = self.ejecutar_sp("sp_obtener_movimientos_demo", (vehiculo_id,))
+    def obtener_historial_limitado(self, vehiculo_id: int):
+        """Devuelve como MÁXIMO los 10 movimientos más recientes."""
+        historial = self.ejecutar_sp("sp_obtener_historial", (vehiculo_id,))
+        return historial[:10] if historial else []
+
+    async def ejecutar_demo(self, vehiculo_id: int, demo_id: int):
+        movimientos = self.ejecutar_sp("sp_obtener_movimientos_demo", (demo_id,))
+        if not movimientos:
+            raise HTTPException(status_code=404, detail="No se encontraron movimientos para esta DEMO")
+
+        # Evento de INICIO por WebSocket[cite: 8]
+        await manager.broadcast_to_vehicle(vehiculo_id, {"evento": "demo_inicio", "vehiculo_id": vehiculo_id})
 
         ultimo_comando = None
         for mov in movimientos:
-            # Adaptamos los nombres de las llaves del diccionario según devuelva el SP
             comando = mov.get("comando_id") or mov.get("id_comando")
             orden = mov.get("orden")
-            duracion = mov.get("duracion", 1)
-            pausa = mov.get("pausa", 0)
+            duracion_ms = mov.get("duracion_ms", mov.get("duracion", 1000))
+            pausa_ms = mov.get("pausa_ms", mov.get("pausa", 0))
 
             ultimo_comando = comando
 
-            await manager.broadcast({
-                "tipo": "demo_movimiento",
+            # Evento por MOVIMIENTO[cite: 8]
+            await manager.broadcast_to_vehicle(vehiculo_id, {
+                "evento": "demo_movimiento",
                 "vehiculo_id": vehiculo_id,
                 "comando_id": comando,
                 "orden": orden,
-                "duracion": duracion,
-                "pausa": pausa
+                "duracion_ms": duracion_ms,
+                "pausa_ms": pausa_ms
             })
 
-            await asyncio.sleep(duracion + pausa)
+            # Respetar duracion_ms + pausa_ms sin bloquear el hilo asíncrono[cite: 8, 9]
+            tiempo_espera_sec = (duracion_ms + pausa_ms) / 1000.0
+            await asyncio.sleep(tiempo_espera_sec)
 
-        if ultimo_comando is not None:
-            self.ejecutar_sp("sp_actualizar_estado", (vehiculo_id, ultimo_comando))
+            # Actualiza último estado en RDS[cite: 8]
+            self.ejecutar_sp("sp_actualizar_estado", (vehiculo_id, comando))
 
-        return {"status": "ok", "mensaje": "DEMO ejecutada y finalizada correctamente"}
+        # Evento de FINALIZACIÓN[cite: 8]
+        await manager.broadcast_to_vehicle(vehiculo_id, {"evento": "demo_fin", "vehiculo_id": vehiculo_id})
+
+        # NOTA: NO se ejecuta sp_registrar_historial durante la DEMO (no se inserta en historial)[cite: 6, 8]
+        return {"status": "ok", "mensaje": "DEMO transmitida por WebSocket sin guardar en historial"}
 
 iot_service = IoTService()
